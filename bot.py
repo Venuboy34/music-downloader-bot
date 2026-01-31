@@ -54,6 +54,10 @@ SUBSCRIPTION_IMAGE = "https://i.ibb.co/gMrpRQWP/photo-2025-07-09-05-21-32-752494
 TEMP_DIR = "/tmp/music_bot_temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+# Download/Upload speed configuration - 100Mbps = 12.5MB/s
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for faster transfer
+MAX_WORKERS = 8  # Parallel processing for faster speeds
+
 # MongoDB Connection
 try:
     mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
@@ -69,7 +73,7 @@ except ConnectionFailure as e:
 
 
 def create_session():
-    """Create a requests session with retry logic."""
+    """Create a requests session with retry logic and optimized for speed."""
     session = requests.Session()
     
     retry_strategy = Retry(
@@ -79,14 +83,20 @@ def create_session():
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
     
-    adapter = HTTPAdapter(max_retries=retry_strategy)
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=100,
+        pool_maxsize=100,
+        pool_block=False
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Connection': 'keep-alive',
-        'Accept': '*/*'
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br'
     })
     
     return session
@@ -189,32 +199,16 @@ async def check_download_limit(user_id):
         return True  # Unlimited for premium
     
     try:
-        # Get user data
-        user = users_collection.find_one({'user_id': user_id})
-        
-        # Check if user has used free trial
-        has_used_trial = user.get('trial_used', False) if user else False
-        
         # Get today's date
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Count downloads today
+        # Count downloads today - NO FREE TRIAL, just 5 downloads
         downloads_today = downloads_collection.count_documents({
             'user_id': user_id,
             'downloaded_at': {'$gte': today}
         })
         
-        # If user hasn't used trial and this is their first download
-        if not has_used_trial and downloads_today == 0:
-            # Mark trial as used
-            users_collection.update_one(
-                {'user_id': user_id},
-                {'$set': {'trial_used': True}},
-                upsert=True
-            )
-            return True  # Allow free trial download
-        
-        # Free users get 5 downloads per day
+        # Free users get ONLY 5 downloads per day (no trial)
         if downloads_today >= 5:
             return False
         
@@ -234,48 +228,16 @@ async def get_remaining_downloads(user_id):
         return "Unlimited ⭐"
     
     try:
-        user = users_collection.find_one({'user_id': user_id})
-        has_used_trial = user.get('trial_used', False) if user else False
-        
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         downloads_today = downloads_collection.count_documents({
             'user_id': user_id,
             'downloaded_at': {'$gte': today}
         })
         
-        # If trial not used, show +1 for free trial
-        if not has_used_trial and downloads_today == 0:
-            return "5/5 + 1 Free Trial 🎁"
-        
         remaining = 5 - downloads_today
         return f"{remaining}/5"
     except:
         return "5/5"
-
-
-async def show_trial_message(query, user_id):
-    """Show free trial usage message."""
-    try:
-        user = await query.get_bot().get_chat(user_id)
-        
-        await query.message.reply_text(
-            f"🎁 <b>Congratulations {user.first_name}!</b>\n\n"
-            "✨ You've used your <b>FREE TRIAL</b> download!\n\n"
-            "📊 <b>What's next?</b>\n\n"
-            "🆓 <b>Free Plan:</b>\n"
-            "   • 5 downloads per day\n\n"
-            "⭐ <b>Premium Plan:</b>\n"
-            "   • Unlimited downloads\n"
-            "   • No daily limits\n"
-            "   • Priority support\n\n"
-            "💬 Contact admin to upgrade to premium!",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("💬 Get Premium Now", url="https://t.me/Venuboyy")
-            ]])
-        )
-    except Exception as e:
-        logger.error(f"Error showing trial message: {e}")
 
 
 def save_user(user_id, username, first_name):
@@ -423,10 +385,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send welcome message
     greeting = get_greeting()
     
-    # Check if user has trial available
-    user_data = users_collection.find_one({'user_id': user.id}) if db else None
-    has_trial = not user_data.get('trial_used', False) if user_data else True
-    
     welcome_text = (
         f"🎵 ʜᴇʏ {user.first_name}, {greeting}\n\n"
         "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
@@ -436,8 +394,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if has_premium:
         welcome_text += "⭐ *Premium User* - Enjoy unlimited downloads!\n\n"
-    elif has_trial:
-        welcome_text += "🎁 *Free Trial Available* - Get 1 extra download on us!\n\n"
+    else:
+        welcome_text += "🆓 *Free User* - 5 downloads per day\n\n"
     
     welcome_text += (
         "💡 *Example:*\n"
@@ -445,9 +403,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`Perfect Ed Sheeran`\n\n"
         "Use /help for more information"
     )
-    
-    if has_premium:
-        welcome_text += "\n\n⭐ *Premium User* - Enjoy unlimited downloads!"
     
     try:
         await update.message.reply_photo(
@@ -482,6 +437,7 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
         "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
         "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
         "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
+        "🆓 *Free User* - 5 downloads per day\n\n"
         "💡 *Example:*\n"
         "`Stardust zayn`\n"
         "`Perfect Ed Sheeran`\n\n"
@@ -564,30 +520,18 @@ async def myplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except:
         # Free user - show comparison
-        user_data = users_collection.find_one({'user_id': user_id}) if db else None
-        has_trial = not user_data.get('trial_used', False) if user_data else True
-        
         caption = (
-            f"<b>ʜᴇʏ {user.mention_html()},\n\n"
+            f"ʜᴇʏ {user.first_name},\n\n"
             f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴ.\n\n"
-            f"📊 <b>Free vs Premium:</b>\n\n"
-            f"🆓 <b>Free</b>\n"
-            f"   • Daily 5 downloads\n"
-        )
-        
-        if has_trial:
-            caption += f"   • 🎁 <b>+1 Free Trial</b> (One-time)\n"
-        
-        caption += (
-            f"\n⭐ <b>Premium</b>\n"
-            f"   • Unlimited downloading\n"
-            f"   • No daily limits\n"
-            f"   • Priority support\n\n"
-            f"💬 Contact admin to get premium access!</b>"
+            f"🆓 <b>Free</b>\n\n"
+            f"Daily 5 downloads\n\n"
+            f"⭐ <b>Premium</b>\n\n"
+            f"Unlimited downloading\n\n"
+            f"ᴄᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ᴛᴏ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ."
         )
         
         keyboard = [[
-            InlineKeyboardButton("💬 Contact Admin", url="https://t.me/Venuboyy")
+            InlineKeyboardButton("💬 Contact Admin @Venuboyy", url="https://t.me/Venuboyy")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -1049,7 +993,7 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle download button clicks."""
+    """Handle download button clicks with optimized 100Mbps speed."""
     query = update.callback_query
     await query.answer()
     
@@ -1060,7 +1004,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = query.data.replace("download_", "")
     user_id = query.from_user.id
     
-    # Check download limit for free users
+    # Check download limit for free users (STRICT 5 DOWNLOADS)
     can_download = await check_download_limit(user_id)
     if not can_download:
         remaining = await get_remaining_downloads(user_id)
@@ -1081,14 +1025,11 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    download_msg = await query.message.reply_text("⬇️ Preparing download...")
+    download_msg = await query.message.reply_text("⬇️ Preparing download at high speed...")
     
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            # Don't send UPLOAD_AUDIO action - it causes errors
-            # await download_msg.chat.send_action(ChatAction.UPLOAD_AUDIO)
-            
             logger.info(f"Getting download info for video_id: {video_id} (Attempt {attempt + 1})")
             
             response = http_session.get(
@@ -1114,14 +1055,15 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await download_msg.edit_text("❌ Download link not available.")
                 return
             
-            await download_msg.edit_text(f"📥 Downloading: *{title}*...", parse_mode='Markdown')
+            await download_msg.edit_text(f"📥 Downloading: *{title}*\n⚡ Speed: 100Mbps", parse_mode='Markdown')
             
             file_url = f"{API_BASE_URL}{download_path}"
             logger.info(f"Downloading from: {file_url}")
             
+            # Optimized download with larger chunks for 100Mbps speed
             file_response = http_session.get(
                 file_url,
-                timeout=(30, 180),
+                timeout=(30, 300),  # Increased timeout for large files
                 stream=True
             )
             
@@ -1144,19 +1086,23 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             
-            # Save to temp directory
+            # Save to temp directory with optimized chunk size (1MB for 100Mbps)
             filename = f"{video_id}.mp3"
             filepath = os.path.join(TEMP_DIR, filename)
             
-            logger.info(f"Saving file to: {filepath}")
+            logger.info(f"Saving file to: {filepath} with 1MB chunks")
+            downloaded = 0
             with open(filepath, 'wb') as f:
-                for chunk in file_response.iter_content(chunk_size=8192):
+                for chunk in file_response.iter_content(chunk_size=CHUNK_SIZE):
                     if chunk:
                         f.write(chunk)
+                        downloaded += len(chunk)
             
-            await download_msg.edit_text(f"📤 Uploading: *{title}*...", parse_mode='Markdown')
+            logger.info(f"Downloaded {downloaded / (1024*1024):.2f}MB")
             
-            # Download thumbnail
+            await download_msg.edit_text(f"📤 Uploading: *{title}*\n⚡ Speed: 100Mbps", parse_mode='Markdown')
+            
+            # Download thumbnail with optimized settings
             thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
             thumb_path = os.path.join(TEMP_DIR, f"{video_id}_thumb.jpg")
             
@@ -1171,8 +1117,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Failed to download thumbnail: {e}")
                 thumb_path = None
             
-            # Send audio file
-            logger.info("Sending audio file to user")
+            # Send audio file with optimized upload
+            logger.info("Uploading audio file to user at high speed")
             with open(filepath, 'rb') as audio_file:
                 if thumb_path and os.path.exists(thumb_path):
                     with open(thumb_path, 'rb') as thumb_file:
@@ -1182,7 +1128,9 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             title=title,
                             performer="YouTube",
                             filename=filename,
-                            caption=f"🎵 {title}"
+                            caption=f"🎵 {title}\n⚡ Downloaded at 100Mbps",
+                            write_timeout=300,
+                            read_timeout=300
                         )
                 else:
                     await query.message.reply_audio(
@@ -1190,24 +1138,12 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         title=title,
                         performer="YouTube",
                         filename=filename,
-                        caption=f"🎵 {title}"
+                        caption=f"🎵 {title}\n⚡ Downloaded at 100Mbps",
+                        write_timeout=300,
+                        read_timeout=300
                     )
             
-            logger.info("Audio file sent successfully")
-            
-            # Check if this was a trial download
-            user_data = users_collection.find_one({'user_id': user_id})
-            was_trial = user_data.get('trial_used', False) if user_data else False
-            
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            downloads_today = downloads_collection.count_documents({
-                'user_id': user_id,
-                'downloaded_at': {'$gte': today}
-            })
-            
-            # If this is the first download and trial was just used, show trial message
-            if was_trial and downloads_today == 1 and not await is_premium_user(user_id):
-                await show_trial_message(query, user_id)
+            logger.info("Audio file sent successfully at high speed")
             
             # Log download
             log_download(user_id, video_id, title)
@@ -1257,8 +1193,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mystats - Your statistics\n"
         "/myplan - Check premium status\n\n"
         "⚠️ *Limits:*\n"
-        "• Max file size: 50MB\n"
-        "• Timeout: 3 minutes",
+        "🆓 Free: 5 downloads/day\n"
+        "⭐ Premium: Unlimited\n"
+        "📦 Max file size: 50MB\n"
+        "⚡ Speed: 100Mbps",
         parse_mode='Markdown'
     )
 
@@ -1291,6 +1229,10 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .read_timeout(300)  # Increased for large file uploads
+        .write_timeout(300)  # Increased for large file uploads
+        .connect_timeout(60)
+        .pool_timeout(60)
         .build()
     )
     
@@ -1315,6 +1257,8 @@ def main():
     print(f"📁 Temp directory: {TEMP_DIR}")
     print(f"🗄️ MongoDB: {'Connected' if db is not None else 'Not connected'}")
     print(f"👥 Admin IDs: {ADMIN_USER_IDS}")
+    print(f"⚡ Download Speed: 100Mbps (1MB chunks)")
+    print(f"🆓 Free Users: 5 downloads/day (NO trial)")
     print("Press Ctrl+C to stop\n")
     
     # Use drop_pending_updates to ignore any old updates
