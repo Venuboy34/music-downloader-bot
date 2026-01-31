@@ -4,7 +4,8 @@ import requests
 import logging
 import time
 import asyncio
-from datetime import datetime
+import pytz
+from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,6 +18,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest, Forbidden
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
@@ -36,6 +38,17 @@ API_BASE_URL = os.environ.get("API_BASE_URL", "https://c0d8a915-cabf-4560-b61b-7
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://Veggo:zero8907@cluster0.o8sxezg.mongodb.net/?appName=Cluster0")
 ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "").split(",") if id.strip()]
+
+# Force subscription channels
+FORCE_SUB_CHANNELS = [
+    {"username": "zerodev2", "url": "https://t.me/zerodev2"},
+    {"username": "mvxyoffcail", "url": "https://t.me/mvxyoffcail"}
+]
+
+# Images
+WELCOME_IMAGE = "https://api.aniwallpaper.workers.dev/random?type=music"
+FORCE_SUB_IMAGE = "https://i.ibb.co/pr2H8cwT/img-8312532076.jpg"
+SUBSCRIPTION_IMAGE = "https://i.ibb.co/gMrpRQWP/photo-2025-07-09-05-21-32-7524948058832896004.jpg"
 
 # Use /tmp for temp files (Render compatible)
 TEMP_DIR = "/tmp/music_bot_temp"
@@ -82,6 +95,90 @@ def create_session():
 http_session = create_session()
 
 
+def get_greeting():
+    """Get greeting based on time of day."""
+    hour = datetime.now().hour
+    if 5 <= hour < 12:
+        return "ɢᴏᴏᴅ ᴍᴏʀɴɪɴɢ 🌞"
+    elif 12 <= hour < 17:
+        return "ɢᴏᴏᴅ ᴀғᴛᴇʀɴᴏᴏɴ ☀️"
+    elif 17 <= hour < 21:
+        return "ɢᴏᴏᴅ ᴇᴠᴇɴɪɴɢ 🌆"
+    else:
+        return "ɢᴏᴏᴅ ɴɪɢʜᴛ 🌙"
+
+
+async def get_seconds(time_str):
+    """Convert time string to seconds."""
+    try:
+        parts = time_str.split()
+        if len(parts) != 2:
+            return 0
+        
+        value = int(parts[0])
+        unit = parts[1].lower()
+        
+        if unit in ['minute', 'minutes', 'min', 'mins']:
+            return value * 60
+        elif unit in ['hour', 'hours', 'hr', 'hrs']:
+            return value * 3600
+        elif unit in ['day', 'days']:
+            return value * 86400
+        elif unit in ['week', 'weeks']:
+            return value * 604800
+        elif unit in ['month', 'months']:
+            return value * 2592000  # 30 days
+        elif unit in ['year', 'years']:
+            return value * 31536000  # 365 days
+        else:
+            return 0
+    except:
+        return 0
+
+
+async def check_user_subscription(user_id, context):
+    """Check if user is subscribed to all required channels."""
+    for channel in FORCE_SUB_CHANNELS:
+        try:
+            member = await context.bot.get_chat_member(
+                chat_id=f"@{channel['username']}", 
+                user_id=user_id
+            )
+            if member.status in ['left', 'kicked']:
+                return False
+        except Exception as e:
+            logger.error(f"Error checking subscription for @{channel['username']}: {e}")
+            return False
+    return True
+
+
+async def is_premium_user(user_id):
+    """Check if user has active premium subscription."""
+    if db is None:
+        return False
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        if user and user.get('expiry_time'):
+            expiry_time = user['expiry_time']
+            if isinstance(expiry_time, str):
+                expiry_time = datetime.fromisoformat(expiry_time)
+            
+            if expiry_time > datetime.now():
+                return True
+            else:
+                # Remove expired premium
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {'expiry_time': ""}}
+                )
+                return False
+        return False
+    except Exception as e:
+        logger.error(f"Error checking premium: {e}")
+        return False
+
+
 def save_user(user_id, username, first_name):
     """Save or update user in database."""
     if db is None:
@@ -113,7 +210,6 @@ def log_download(user_id, video_id, title):
         return
     
     try:
-        # Save download record
         downloads_collection.insert_one({
             'user_id': user_id,
             'video_id': video_id,
@@ -121,13 +217,11 @@ def log_download(user_id, video_id, title):
             'downloaded_at': datetime.now()
         })
         
-        # Increment user download count
         users_collection.update_one(
             {'user_id': user_id},
             {'$inc': {'total_downloads': 1}}
         )
         
-        # Update global stats
         stats_collection.update_one(
             {'_id': 'global'},
             {
@@ -148,8 +242,8 @@ def get_stats():
     try:
         total_users = users_collection.count_documents({})
         total_downloads = downloads_collection.count_documents({})
+        premium_users = users_collection.count_documents({'expiry_time': {'$exists': True}})
         
-        # Get top downloaders
         top_users = list(users_collection.find(
             {},
             {'first_name': 1, 'total_downloads': 1}
@@ -158,6 +252,7 @@ def get_stats():
         return {
             'total_users': total_users,
             'total_downloads': total_downloads,
+            'premium_users': premium_users,
             'top_users': top_users
         }
     except Exception as e:
@@ -169,50 +264,404 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     user = update.effective_user
     
-    # Save user to database
     save_user(user.id, user.username, user.first_name)
     
-    # Send sticker first
-    sticker_msg = await update.message.reply_sticker(
-        sticker="CAACAgIAAxkBAAEQYt1pfZPhPjP99PZfe3GQoyoKNlrStgACBT0AAiUmaUjLrgS38Ul59jgE"
-    )
+    # Check if user has premium
+    has_premium = await is_premium_user(user.id)
     
-    # Wait a bit then delete the sticker
-    await asyncio.sleep(2)
+    # If not premium, check subscription
+    if not has_premium:
+        is_subscribed = await check_user_subscription(user.id, context)
+        
+        if not is_subscribed:
+            keyboard = []
+            for channel in FORCE_SUB_CHANNELS:
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"📢 Join {channel['username']}", 
+                        url=channel['url']
+                    )
+                ])
+            keyboard.append([
+                InlineKeyboardButton("✅ I Joined", callback_data="check_subscription")
+            ])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            try:
+                await update.message.reply_photo(
+                    photo=FORCE_SUB_IMAGE,
+                    caption=(
+                        f"👋 Hello {user.first_name}!\n\n"
+                        "⚠️ You must join our channels to use this bot.\n\n"
+                        "Please join all channels below and click 'I Joined' button:"
+                    ),
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logger.error(f"Error sending force sub photo: {e}")
+                await update.message.reply_text(
+                    f"👋 Hello {user.first_name}!\n\n"
+                    "⚠️ You must join our channels to use this bot.\n\n"
+                    "Please join all channels below and click 'I Joined' button:",
+                    reply_markup=reply_markup
+                )
+            return
+    
+    # Send sticker
     try:
-        await sticker_msg.delete()
-    except:
-        pass
+        sticker_msg = await update.message.reply_sticker(
+            sticker="CAACAgIAAxkBAAEQYt1pfZPhPjP99PZfe3GQoyoKNlrStgACBT0AAiUmaUjLrgS38Ul59jgE"
+        )
+        await asyncio.sleep(2)
+        try:
+            await sticker_msg.delete()
+        except:
+            pass
+    except Exception as e:
+        logger.warning(f"Error with sticker: {e}")
     
     # Send welcome message
-    await update.message.reply_text(
-        f"👋 Hello {user.first_name}!\n\n"
-        "🎵 *Welcome to Music Downloader Bot!*\n\n"
-        "I can help you download music from YouTube.\n\n"
-        "📝 *How to use:*\n"
-        "Just send me any song name or artist and I'll find it for you!\n\n"
+    greeting = get_greeting()
+    welcome_text = (
+        f"🎵 ʜᴇʏ {user.first_name}, {greeting}\n\n"
+        "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
+        "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
+        "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
         "💡 *Example:*\n"
         "`Stardust zayn`\n"
         "`Perfect Ed Sheeran`\n\n"
-        "📊 Use /stats to see download statistics\n"
-        "❓ Use /help for more information",
-        parse_mode='Markdown'
+        "Use /help for more information"
     )
+    
+    if has_premium:
+        welcome_text += "\n\n⭐ *Premium User* - Enjoy unlimited downloads!"
+    
+    try:
+        await update.message.reply_photo(
+            photo=WELCOME_IMAGE,
+            caption=welcome_text,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error sending welcome photo: {e}")
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle subscription check callback."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    is_subscribed = await check_user_subscription(user_id, context)
+    
+    if not is_subscribed:
+        await query.answer(
+            "❌ You haven't joined all channels yet! Please join and try again.",
+            show_alert=True
+        )
+        return
+    
+    greeting = get_greeting()
+    welcome_text = (
+        f"🎵 ʜᴇʏ {query.from_user.first_name}, {greeting}\n\n"
+        "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
+        "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
+        "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
+        "💡 *Example:*\n"
+        "`Stardust zayn`\n"
+        "`Perfect Ed Sheeran`\n\n"
+        "Use /help for more information"
+    )
+    
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    try:
+        await query.message.reply_photo(
+            photo=WELCOME_IMAGE,
+            caption=welcome_text,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error sending welcome photo: {e}")
+        await query.message.reply_text(welcome_text, parse_mode='Markdown')
+
+
+async def myplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's premium plan."""
+    user = update.message.from_user
+    user_id = user.id
+    
+    if db is None:
+        await update.message.reply_text("❌ Database not connected.")
+        return
+    
+    try:
+        data = users_collection.find_one({'user_id': user_id})
+        
+        if data and data.get('expiry_time'):
+            expiry = data['expiry_time']
+            if isinstance(expiry, str):
+                expiry = datetime.fromisoformat(expiry)
+            
+            expiry_ist = expiry.astimezone(pytz.timezone("Asia/Kolkata"))
+            expiry_str = expiry_ist.strftime("%d-%m-%Y\n⏱️ ᴇxᴘɪʀʏ ᴛɪᴍᴇ : %I:%M:%S %p")
+            
+            current_time = datetime.now(pytz.timezone("Asia/Kolkata"))
+            time_left = expiry_ist - current_time
+            
+            if time_left.total_seconds() <= 0:
+                # Expired
+                users_collection.update_one(
+                    {'user_id': user_id},
+                    {'$unset': {'expiry_time': ""}}
+                )
+                raise Exception("Premium expired")
+            
+            days = time_left.days
+            hours, remainder = divmod(time_left.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            time_left_str = f"{days} ᴅᴀʏꜱ, {hours} ʜᴏᴜʀꜱ, {minutes} ᴍɪɴᴜᴛᴇꜱ"
+            
+            caption = (
+                f"⚜️ <b>ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ᴅᴀᴛᴀ :</b>\n\n"
+                f"👤 <b>ᴜꜱᴇʀ :</b> {user.mention_html()}\n"
+                f"⚡ <b>ᴜꜱᴇʀ ɪᴅ :</b> <code>{user_id}</code>\n"
+                f"⏰ <b>ᴛɪᴍᴇ ʟᴇꜰᴛ :</b> {time_left_str}\n"
+                f"⌛️ <b>ᴇxᴘɪʀʏ ᴅᴀᴛᴇ :</b> {expiry_str}"
+            )
+            
+            await update.message.reply_photo(
+                photo=SUBSCRIPTION_IMAGE,
+                caption=caption,
+                parse_mode='HTML'
+            )
+        else:
+            raise Exception("No premium")
+            
+    except:
+        await update.message.reply_photo(
+            photo=SUBSCRIPTION_IMAGE,
+            caption=(
+                f"<b>ʜᴇʏ {user.mention_html()},\n\n"
+                f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴ.\n"
+                f"ᴄᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ᴛᴏ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ.</b>"
+            ),
+            parse_mode='HTML'
+        )
+
+
+async def add_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add premium to a user (Admin only)."""
+    user_id = update.effective_user.id
+    
+    if not ADMIN_USER_IDS or user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ This command is only for administrators.")
+        return
+    
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "📌 ᴜsᴀɢᴇ: <code>/add_premium user_id time</code>\n"
+            "📅 ᴇxᴀᴍᴘʟᴇ: <code>/add_premium 123456 1 month</code>\n"
+            "🧭 ᴀᴄᴄᴇᴘᴛᴇᴅ ꜰᴏʀᴍᴀᴛs: <code>1 day</code>, <code>1 hour</code>, <code>1 min</code>, <code>1 month</code>, <code>1 year</code>",
+            parse_mode='HTML'
+        )
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        time_str = " ".join(context.args[1:])
+        
+        seconds = await get_seconds(time_str)
+        if seconds <= 0:
+            await update.message.reply_text(
+                "❌ ɪɴᴠᴀʟɪᴅ ᴛɪᴍᴇ ꜰᴏʀᴍᴀᴛ ❗\n"
+                "🕒 ᴘʟᴇᴀsᴇ ᴜsᴇ: <code>1 day</code>, <code>1 hour</code>, <code>1 min</code>, <code>1 month</code>, or <code>1 year</code>",
+                parse_mode='HTML'
+            )
+            return
+        
+        target_user = await context.bot.get_chat(target_user_id)
+        
+        time_zone = datetime.now(pytz.timezone("Asia/Kolkata"))
+        current_time = time_zone.strftime("%d-%m-%Y | %I:%M:%S %p")
+        
+        expiry_time = datetime.now() + timedelta(seconds=seconds)
+        
+        users_collection.update_one(
+            {'user_id': target_user_id},
+            {
+                '$set': {
+                    'expiry_time': expiry_time,
+                    'premium_since': datetime.now()
+                }
+            },
+            upsert=True
+        )
+        
+        expiry_ist = expiry_time.astimezone(pytz.timezone("Asia/Kolkata"))
+        expiry_str = expiry_ist.strftime("%d-%m-%Y | %I:%M:%S %p")
+        
+        await update.message.reply_text(
+            f"ᴘʀᴇᴍɪᴜᴍ ᴀᴅᴅᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ ✅\n\n"
+            f"👤 ᴜꜱᴇʀ : {target_user.first_name}\n"
+            f"⚡ ᴜꜱᴇʀ ɪᴅ : <code>{target_user_id}</code>\n"
+            f"⏰ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ : <code>{time_str}</code>\n"
+            f"⏳ ᴊᴏɪɴɪɴɢ ᴅᴀᴛᴇ : {current_time}\n"
+            f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {expiry_str}",
+            parse_mode='HTML'
+        )
+        
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    f"👋 ʜᴇʏ {target_user.first_name},\n"
+                    f"ᴛʜᴀɴᴋ ʏᴏᴜ ꜰᴏʀ ᴘᴜʀᴄʜᴀꜱɪɴɢ ᴘʀᴇᴍɪᴜᴍ.\n"
+                    f"ᴇɴᴊᴏʏ !! ✨🎉\n\n"
+                    f"⏰ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ : <code>{time_str}</code>\n"
+                    f"⏳ ᴊᴏɪɴɪɴɢ ᴅᴀᴛᴇ : {current_time}\n"
+                    f"⌛️ ᴇxᴘɪʀʏ ᴅᴀᴛᴇ : {expiry_str}"
+                ),
+                parse_mode='HTML'
+            )
+        except:
+            pass
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID!")
+    except Exception as e:
+        logger.error(f"Error adding premium: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def remove_premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove premium from a user (Admin only)."""
+    user_id = update.effective_user.id
+    
+    if not ADMIN_USER_IDS or user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ This command is only for administrators.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("ᴜꜱᴀɢᴇ : /remove_premium user_id")
+        return
+    
+    try:
+        target_user_id = int(context.args[0])
+        
+        result = users_collection.update_one(
+            {'user_id': target_user_id},
+            {'$unset': {'expiry_time': "", 'premium_since': ""}}
+        )
+        
+        if result.modified_count > 0:
+            await update.message.reply_text("ᴜꜱᴇʀ ʀᴇᴍᴏᴠᴇᴅ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟʟʏ !")
+            
+            try:
+                target_user = await context.bot.get_chat(target_user_id)
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"👋 ʜᴇʏ {target_user.first_name},\n\nʏᴏᴜʀ ᴘʀᴇᴍɪᴜᴍ sᴜʙsᴄʀɪᴘᴛɪᴏɴ ʜᴀs ᴇɴᴅᴇᴅ."
+                )
+            except:
+                pass
+        else:
+            await update.message.reply_text("ᴜɴᴀʙʟᴇ ᴛᴏ ʀᴇᴍᴏᴠᴇ ᴜꜱᴇʀ !\nᴀʀᴇ ʏᴏᴜ ꜱᴜʀᴇ, ɪᴛ ᴡᴀꜱ ᴀ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀ ɪᴅ ?")
+            
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID!")
+    except Exception as e:
+        logger.error(f"Error removing premium: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def premium_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all premium users (Admin only)."""
+    user_id = update.effective_user.id
+    
+    if not ADMIN_USER_IDS or user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ This command is only for administrators.")
+        return
+    
+    if db is None:
+        await update.message.reply_text("❌ Database not connected.")
+        return
+    
+    try:
+        msg = await update.message.reply_text("<i>ꜰᴇᴛᴄʜɪɴɢ...</i>", parse_mode='HTML')
+        
+        premium_users = users_collection.find({'expiry_time': {'$exists': True}})
+        
+        text = "⭐ ᴘʀᴇᴍɪᴜᴍ ᴜꜱᴇʀꜱ ʟɪꜱᴛ :\n\n"
+        count = 1
+        
+        for user_data in premium_users:
+            try:
+                expiry = user_data['expiry_time']
+                if isinstance(expiry, str):
+                    expiry = datetime.fromisoformat(expiry)
+                
+                expiry_ist = expiry.astimezone(pytz.timezone("Asia/Kolkata"))
+                current_time = datetime.now(pytz.timezone("Asia/Kolkata"))
+                
+                if expiry_ist > current_time:
+                    time_left = expiry_ist - current_time
+                    days = time_left.days
+                    hours, remainder = divmod(time_left.seconds, 3600)
+                    minutes, _ = divmod(remainder, 60)
+                    
+                    expiry_str = expiry_ist.strftime("%d-%m-%Y | %I:%M:%S %p")
+                    
+                    try:
+                        user = await context.bot.get_chat(user_data['user_id'])
+                        name = user.first_name
+                    except:
+                        name = user_data.get('first_name', 'Unknown')
+                    
+                    text += (
+                        f"{count}. {name}\n"
+                        f"👤 ᴜꜱᴇʀ ɪᴅ : {user_data['user_id']}\n"
+                        f"⏳ ᴇxᴘɪʀʏ : {expiry_str}\n"
+                        f"⏰ ᴛɪᴍᴇ ʟᴇꜰᴛ : {days}d {hours}h {minutes}m\n\n"
+                    )
+                    count += 1
+            except Exception as e:
+                logger.error(f"Error processing premium user: {e}")
+                continue
+        
+        if count == 1:
+            text += "No premium users found."
+        
+        await msg.edit_text(text)
+        
+    except Exception as e:
+        logger.error(f"Error listing premium users: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show bot statistics."""
+    """Show bot statistics (Admin only)."""
+    user_id = update.effective_user.id
+    
+    if not ADMIN_USER_IDS or user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ This command is only for administrators.")
+        return
+    
     stats = get_stats()
     
     if not stats:
         await update.message.reply_text(
-            "📊 *Statistics*\n\n"
-            "Database not connected. Stats unavailable.",
+            "📊 *Statistics*\n\nDatabase not connected. Stats unavailable.",
             parse_mode='Markdown'
         )
         return
     
-    # Build top users text
     top_users_text = ""
     for idx, user in enumerate(stats['top_users'], 1):
         name = user.get('first_name', 'Unknown')
@@ -222,8 +671,9 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_users_text += f"{medal} {name}: {downloads} downloads\n"
     
     await update.message.reply_text(
-        "📊 *Bot Statistics*\n\n"
+        "📊 *Bot Statistics (Admin Only)*\n\n"
         f"👥 Total Users: *{stats['total_users']:,}*\n"
+        f"⭐ Premium Users: *{stats['premium_users']:,}*\n"
         f"📥 Total Downloads: *{stats['total_downloads']:,}*\n\n"
         "🏆 *Top Downloaders:*\n"
         f"{top_users_text}",
@@ -235,7 +685,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users (admin only)."""
     user_id = update.effective_user.id
     
-    # Check if user is admin
     if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ This command is only for administrators.")
         return
@@ -272,12 +721,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 success += 1
                 
-                # Small delay to avoid rate limits
                 if success % 20 == 0:
                     await status_msg.edit_text(
                         f"📤 Broadcasting...\n✅ Sent: {success}\n❌ Failed: {failed}"
                     )
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     
             except Exception as e:
                 logger.error(f"Failed to send to {user['user_id']}: {e}")
@@ -299,6 +747,16 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's personal statistics."""
     user_id = update.effective_user.id
     
+    # Check subscription for non-premium users
+    has_premium = await is_premium_user(user_id)
+    if not has_premium:
+        is_subscribed = await check_user_subscription(user_id, context)
+        if not is_subscribed:
+            await update.message.reply_text(
+                "⚠️ Please join our channels first! Use /start to see the channels."
+            )
+            return
+    
     if db is None:
         await update.message.reply_text("❌ Database not connected.")
         return
@@ -313,11 +771,13 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         downloads = user.get('total_downloads', 0)
         joined = user.get('joined_at', datetime.now())
         
-        # Get user's rank
         rank = users_collection.count_documents({'total_downloads': {'$gt': downloads}}) + 1
+        
+        status = "⭐ Premium User" if has_premium else "👤 Free User"
         
         await update.message.reply_text(
             "📊 *Your Statistics*\n\n"
+            f"{status}\n"
             f"📥 Total Downloads: *{downloads}*\n"
             f"🏆 Global Rank: *#{rank}*\n"
             f"📅 Member Since: {joined.strftime('%B %d, %Y')}\n",
@@ -330,10 +790,20 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for music based on user query."""
-    query = update.message.text.strip()
     user_id = update.effective_user.id
     
-    # Save user activity
+    # Check premium or subscription
+    has_premium = await is_premium_user(user_id)
+    if not has_premium:
+        is_subscribed = await check_user_subscription(user_id, context)
+        if not is_subscribed:
+            await update.message.reply_text(
+                "⚠️ Please join our channels first! Use /start to see the channels."
+            )
+            return
+    
+    query = update.message.text.strip()
+    
     save_user(user_id, update.effective_user.username, update.effective_user.first_name)
     
     if not query:
@@ -365,7 +835,7 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await searching_msg.edit_text(
                         f"⚠️ Search failed (attempt {attempt + 1}/{max_retries}). Retrying..."
                     )
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     continue
                 else:
                     await searching_msg.edit_text("❌ Search failed. Please try again.")
@@ -416,7 +886,7 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Search error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
                 await searching_msg.edit_text(f"⚠️ Error. Retrying... ({attempt + 1}/{max_retries})")
-                time.sleep(2)
+                await asyncio.sleep(2)
             else:
                 await searching_msg.edit_text("❌ An error occurred. Please try again.")
 
@@ -438,7 +908,8 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            await download_msg.chat.send_action(ChatAction.UPLOAD_AUDIO)
+            # Don't send UPLOAD_AUDIO action - it causes errors
+            # await download_msg.chat.send_action(ChatAction.UPLOAD_AUDIO)
             
             logger.info(f"Getting download info for video_id: {video_id} (Attempt {attempt + 1})")
             
@@ -451,7 +922,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if response.status_code != 200:
                 if attempt < max_retries - 1:
                     await download_msg.edit_text(f"⚠️ Retrying... ({attempt + 1}/{max_retries})")
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     continue
                 else:
                     await download_msg.edit_text("❌ Failed to get download link.")
@@ -479,7 +950,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if file_response.status_code != 200:
                 if attempt < max_retries - 1:
                     await download_msg.edit_text(f"⚠️ Download failed. Retrying... ({attempt + 1}/{max_retries})")
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     continue
                 else:
                     await download_msg.edit_text("❌ Failed to download the file.")
@@ -546,7 +1017,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             logger.info("Audio file sent successfully")
             
-            # Log download to database
+            # Log download
             log_download(user_id, video_id, title)
             
             # Cleanup temp files
@@ -571,7 +1042,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Download error (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
                 await download_msg.edit_text(f"⚠️ Error. Retrying... ({attempt + 1}/{max_retries})")
-                time.sleep(2)
+                await asyncio.sleep(2)
             else:
                 await download_msg.edit_text(f"❌ An error occurred: {str(e)[:200]}")
 
@@ -591,9 +1062,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Commands:*\n"
         "/start - Start the bot\n"
         "/help - Show this help\n"
-        "/stats - Global statistics\n"
         "/mystats - Your statistics\n"
-        "/broadcast - Send message to all (admin only)\n\n"
+        "/myplan - Check premium status\n\n"
         "⚠️ *Limits:*\n"
         "• Max file size: 50MB\n"
         "• Timeout: 3 minutes",
@@ -606,6 +1076,16 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
 
 
+async def post_init(application: Application) -> None:
+    """Clean up any existing webhooks/polling sessions after app initialization."""
+    try:
+        logger.info("Cleaning up existing connections...")
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook deleted, ready for polling")
+    except Exception as e:
+        logger.warning(f"Error during cleanup: {e}")
+
+
 def main():
     """Start the bot."""
     if not BOT_TOKEN:
@@ -615,14 +1095,24 @@ def main():
         sys.exit(1)
     
     logger.info("Creating bot application...")
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     
     # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("mystats", my_stats))
+    application.add_handler(CommandHandler("myplan", myplan_command))
+    application.add_handler(CommandHandler("add_premium", add_premium_command))
+    application.add_handler(CommandHandler("remove_premium", remove_premium_command))
+    application.add_handler(CommandHandler("premium_users", premium_users_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_music))
     application.add_handler(CallbackQueryHandler(download_callback))
     
@@ -632,9 +1122,14 @@ def main():
     print("\n✅ Bot is running!")
     print(f"📁 Temp directory: {TEMP_DIR}")
     print(f"🗄️ MongoDB: {'Connected' if db is not None else 'Not connected'}")
+    print(f"👥 Admin IDs: {ADMIN_USER_IDS}")
     print("Press Ctrl+C to stop\n")
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Use drop_pending_updates to ignore any old updates
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True
+    )
 
 
 if __name__ == '__main__':
