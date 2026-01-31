@@ -22,6 +22,10 @@ from telegram.error import BadRequest, Forbidden
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 
+# Flask for health checks (prevents Render timeout)
+from flask import Flask
+from threading import Thread
+
 # Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -32,6 +36,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Silence Flask logs
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # Configuration from environment variables
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://c0d8a915-cabf-4560-b61b-799b5757aff1-00-3jh8y5tlvnt4v.spock.replit.dev")
@@ -71,6 +78,23 @@ except ConnectionFailure as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
     db = None
 
+# Flask app for health checks (prevents Render timeout)
+app = Flask(__name__)
+
+@app.route('/')
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Render."""
+    return {
+        "status": "ok",
+        "bot": "running",
+        "timestamp": datetime.now().isoformat()
+    }, 200
+
+def run_flask():
+    """Run Flask server in background."""
+    app.run(host='0.0.0.0', port=10000, debug=False, use_reloader=False)
+
 
 def create_session():
     """Create a requests session with retry logic and optimized for speed."""
@@ -106,8 +130,12 @@ http_session = create_session()
 
 
 def get_greeting():
-    """Get greeting based on time of day."""
-    hour = datetime.now().hour
+    """Get greeting based on time of day in Asia/Kolkata timezone (India/Sri Lanka)."""
+    # Get current time in Asia/Kolkata timezone
+    kolkata_tz = pytz.timezone('Asia/Kolkata')
+    current_time = datetime.now(kolkata_tz)
+    hour = current_time.hour
+    
     if 5 <= hour < 12:
         return "ɢᴏᴏᴅ ᴍᴏʀɴɪɴɢ 🌞"
     elif 12 <= hour < 17:
@@ -1224,6 +1252,12 @@ def main():
         print("Please set the BOT_TOKEN environment variable\n")
         sys.exit(1)
     
+    # Start Flask health check server in background thread
+    logger.info("Starting Flask health check server...")
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask health check server started on port 10000")
+    
     logger.info("Creating bot application...")
     application = (
         Application.builder()
@@ -1254,11 +1288,13 @@ def main():
     
     logger.info("Bot started successfully! Press Ctrl+C to stop.")
     print("\n✅ Bot is running!")
+    print(f"🌐 Health check: http://0.0.0.0:10000/health")
     print(f"📁 Temp directory: {TEMP_DIR}")
     print(f"🗄️ MongoDB: {'Connected' if db is not None else 'Not connected'}")
     print(f"👥 Admin IDs: {ADMIN_USER_IDS}")
     print(f"⚡ Download Speed: 100Mbps (1MB chunks)")
     print(f"🆓 Free Users: 5 downloads/day (NO trial)")
+    print(f"🌍 Timezone: Asia/Kolkata (India/Sri Lanka)")
     print("Press Ctrl+C to stop\n")
     
     # Use drop_pending_updates to ignore any old updates
