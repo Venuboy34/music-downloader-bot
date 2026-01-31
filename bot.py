@@ -84,7 +84,7 @@ http_session = create_session()
 
 def save_user(user_id, username, first_name):
     """Save or update user in database."""
-    if not db:
+    if db is None:
         return
     
     try:
@@ -109,7 +109,7 @@ def save_user(user_id, username, first_name):
 
 def log_download(user_id, video_id, title):
     """Log a download to the database."""
-    if not db:
+    if db is None:
         return
     
     try:
@@ -142,7 +142,7 @@ def log_download(user_id, video_id, title):
 
 def get_stats():
     """Get bot statistics."""
-    if not db:
+    if db is None:
         return None
     
     try:
@@ -249,7 +249,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    if not db:
+    if db is None:
         await update.message.reply_text("❌ Database not connected. Cannot broadcast.")
         return
     
@@ -299,7 +299,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show user's personal statistics."""
     user_id = update.effective_user.id
     
-    if not db:
+    if db is None:
         await update.message.reply_text("❌ Database not connected.")
         return
     
