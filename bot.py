@@ -178,7 +178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     # Wait a bit then delete the sticker
-    await time.sleep(2)
+    await asyncio.sleep(2)
     try:
         await sticker_msg.delete()
     except:
@@ -631,7 +631,7 @@ def main():
     logger.info("Bot started successfully! Press Ctrl+C to stop.")
     print("\n✅ Bot is running!")
     print(f"📁 Temp directory: {TEMP_DIR}")
-    print(f"🗄️ MongoDB: {'Connected' if db else 'Not connected'}")
+    print(f"🗄️ MongoDB: {'Connected' if db is not None else 'Not connected'}")
     print("Press Ctrl+C to stop\n")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
