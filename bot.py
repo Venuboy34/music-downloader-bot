@@ -46,6 +46,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://Veggo:zero8907@cluster0.o8sxezg.mongodb.net/?appName=Cluster0")
 ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "").split(",") if id.strip()]
 
+# URL Shortener Configuration
+SHORTENER_API = "920693e8f5b3e7289bd203327543123631080f07"
+SHORTENER_DOMAIN = "https://userlinks.in/st"
+
 # Force subscription channels
 FORCE_SUB_CHANNELS = [
     {"username": "zerodev2", "url": "https://t.me/zerodev2"},
@@ -73,6 +77,7 @@ try:
     users_collection = db['users']
     downloads_collection = db['downloads']
     stats_collection = db['stats']
+    verification_collection = db['verifications']  # New collection for tracking verifications
     logger.info("✅ MongoDB connected successfully")
 except ConnectionFailure as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
@@ -144,6 +149,71 @@ def get_greeting():
         return "ɢᴏᴏᴅ ᴇᴠᴇɴɪɴɢ 🌆"
     else:
         return "ɢᴏᴏᴅ ɴɪɢʜᴛ 🌙"
+
+
+def generate_verification_link(user_id, context):
+    """Generate a shortened verification link for the user."""
+    try:
+        bot_username = context.bot.username
+        callback_url = f"https://t.me/{bot_username}?start=verified_{user_id}"
+        
+        # Create shortened URL using userlinks.in API
+        short_url = f"{SHORTENER_DOMAIN}?api={SHORTENER_API}&url={callback_url}"
+        
+        return short_url
+    except Exception as e:
+        logger.error(f"Error generating verification link: {e}")
+        return None
+
+
+async def get_verification_credits(user_id):
+    """Get remaining verification credits (5 downloads per verification)."""
+    if db is None:
+        return 0
+    
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Count total verifications today
+        total_verifications = verification_collection.count_documents({
+            'user_id': user_id,
+            'verified_at': {'$gte': today}
+        })
+        
+        # Count downloads today
+        downloads_today = downloads_collection.count_documents({
+            'user_id': user_id,
+            'downloaded_at': {'$gte': today}
+        })
+        
+        # Calculate total credits available (5 base + 5 per verification)
+        total_credits = 5 + (total_verifications * 5)
+        
+        # Calculate remaining
+        remaining = total_credits - downloads_today
+        
+        return max(0, remaining)
+    except Exception as e:
+        logger.error(f"Error getting verification credits: {e}")
+        return 0
+
+
+async def mark_user_verified(user_id):
+    """Mark user as verified and grant 5 additional downloads."""
+    if db is None:
+        return False
+    
+    try:
+        # Add verification record (no limit on how many times per day)
+        verification_collection.insert_one({
+            'user_id': user_id,
+            'verified_at': datetime.now()
+        })
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error marking verification: {e}")
+        return False
 
 
 async def get_seconds(time_str):
@@ -227,20 +297,14 @@ async def check_download_limit(user_id):
         return True  # Unlimited for premium
     
     try:
-        # Get today's date
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Get verification credits
+        credits = await get_verification_credits(user_id)
         
-        # Count downloads today - NO FREE TRIAL, just 5 downloads
-        downloads_today = downloads_collection.count_documents({
-            'user_id': user_id,
-            'downloaded_at': {'$gte': today}
-        })
+        # If user has credits remaining, allow download
+        if credits > 0:
+            return True
         
-        # Free users get ONLY 5 downloads per day (no trial)
-        if downloads_today >= 5:
-            return False
-        
-        return True
+        return False
     except Exception as e:
         logger.error(f"Error checking download limit: {e}")
         return True  # Allow on error
@@ -256,14 +320,25 @@ async def get_remaining_downloads(user_id):
         return "Unlimited ⭐"
     
     try:
+        credits = await get_verification_credits(user_id)
+        
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Count verifications today
+        total_verifications = verification_collection.count_documents({
+            'user_id': user_id,
+            'verified_at': {'$gte': today}
+        })
+        
+        # Count downloads today
         downloads_today = downloads_collection.count_documents({
             'user_id': user_id,
             'downloaded_at': {'$gte': today}
         })
         
-        remaining = 5 - downloads_today
-        return f"{remaining}/5"
+        total_credits = 5 + (total_verifications * 5)
+        
+        return f"{credits}/{total_credits}"
     except:
         return "5/5"
 
@@ -353,6 +428,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send a message when the command /start is issued."""
     user = update.effective_user
     
+    # Check if this is a verification callback
+    if context.args and len(context.args) > 0:
+        arg = context.args[0]
+        if arg.startswith('verified_'):
+            try:
+                verified_user_id = int(arg.replace('verified_', ''))
+                
+                if verified_user_id == user.id:
+                    # Mark user as verified
+                    success = await mark_user_verified(user.id)
+                    
+                    if success:
+                        credits = await get_verification_credits(user.id)
+                        await update.message.reply_text(
+                            "✅ *Verification Successful!*\n\n"
+                            "🎉 You've earned 5 additional downloads!\n"
+                            f"📊 Remaining downloads: {credits}\n\n"
+                            "💡 Tip: You can verify multiple times to get more downloads!\n\n"
+                            "You can now download more songs! 🎵",
+                            parse_mode='Markdown'
+                        )
+                    else:
+                        await update.message.reply_text(
+                            "❌ Verification failed. Please try again.",
+                            parse_mode='Markdown'
+                        )
+                    return
+            except Exception as e:
+                logger.error(f"Error processing verification: {e}")
+    
     save_user(user.id, user.username, user.first_name)
     
     # Check if user has premium
@@ -423,7 +528,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_premium:
         welcome_text += "⭐ *Premium User* - Enjoy unlimited downloads!\n\n"
     else:
-        welcome_text += "🆓 *Free User* - 5 downloads per day\n\n"
+        welcome_text += "🆓 *Free User* - 5 downloads per day\n"
+        welcome_text += "💎 Earn +5 downloads by verifying! Use /verify\n\n"
     
     welcome_text += (
         "💡 *Example:*\n"
@@ -441,6 +547,55 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error sending welcome photo: {e}")
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+
+async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send verification link to earn additional downloads."""
+    user = update.effective_user
+    user_id = user.id
+    
+    # Check if premium user
+    if await is_premium_user(user_id):
+        await update.message.reply_text(
+            "⭐ You're a premium user with unlimited downloads!\n\n"
+            "No need to verify. 😊"
+        )
+        return
+    
+    # Get current credits
+    credits = await get_verification_credits(user_id)
+    
+    # Generate verification link
+    verify_link = generate_verification_link(user_id, context)
+    
+    if not verify_link:
+        await update.message.reply_text(
+            "❌ Error generating verification link. Please try again later."
+        )
+        return
+    
+    keyboard = [[
+        InlineKeyboardButton("🔗 Verify & Earn +5 Downloads", url=verify_link)
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "💎 *Earn Extra Downloads!*\n\n"
+        f"📊 Current remaining: {credits} downloads\n\n"
+        "🎁 Complete verification to get:\n"
+        "   • +5 additional downloads instantly!\n\n"
+        "📝 *How it works:*\n"
+        "1. Click the button below\n"
+        "2. Complete the verification\n"
+        "3. Get instant +5 downloads!\n\n"
+        "💡 *Unlimited verifications!*\n"
+        "Need more downloads? Just verify again!\n\n"
+        "⏰ Daily quota: 5 downloads (base)\n"
+        "💎 Each verification: +5 downloads\n"
+        "🔄 Resets daily at midnight",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
 
 async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +620,8 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
         "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
         "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
         "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
-        "🆓 *Free User* - 5 downloads per day\n\n"
+        "🆓 *Free User* - 5 downloads per day\n"
+        "💎 Earn +5 downloads by verifying! Use /verify\n\n"
         "💡 *Example:*\n"
         "`Stardust zayn`\n"
         "`Perfect Ed Sheeran`\n\n"
@@ -548,19 +704,33 @@ async def myplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except:
         # Free user - show comparison
+        credits = await get_verification_credits(user_id)
+        
         caption = (
             f"ʜᴇʏ {user.first_name},\n\n"
             f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴ.\n\n"
-            f"🆓 <b>Free</b>\n\n"
-            f"Daily 5 downloads\n\n"
-            f"⭐ <b>Premium</b>\n\n"
-            f"Unlimited downloading\n\n"
+            f"🆓 <b>Free Plan</b>\n"
+            f"• 5 downloads per day (base)\n"
+            f"• 💎 Verify to earn +5 downloads each time\n"
+            f"• 📊 Current remaining: {credits}\n\n"
+            f"⭐ <b>Premium</b>\n"
+            f"• Unlimited downloading\n"
+            f"• No verification needed\n"
+            f"• High-speed downloads\n\n"
             f"ᴄᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ᴛᴏ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ."
         )
         
-        keyboard = [[
+        keyboard = []
+        
+        if credits == 0:
+            keyboard.append([
+                InlineKeyboardButton("💎 Verify & Get +5 Downloads", callback_data="verify_now")
+            ])
+        
+        keyboard.append([
             InlineKeyboardButton("💬 Contact Admin @Venuboyy", url="https://t.me/Venuboyy")
-        ]]
+        ])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_photo(
@@ -890,6 +1060,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status = "⭐ Premium User" if has_premium else "🆓 Free User"
         remaining = await get_remaining_downloads(user_id)
+        credits = await get_verification_credits(user_id)
         
         stats_text = (
             "📊 *Your Statistics*\n\n"
@@ -901,10 +1072,18 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not has_premium:
             stats_text += f"\n📊 Today's Downloads: *{remaining}*"
+            if credits == 0:
+                stats_text += "\n💎 Use /verify to earn +5 downloads!"
         
         keyboard = [[
             InlineKeyboardButton("💬 Get Premium", url="https://t.me/Venuboyy")
         ]]
+        
+        if not has_premium and credits == 0:
+            keyboard.insert(0, [
+                InlineKeyboardButton("💎 Verify & Earn +5", callback_data="verify_now")
+            ])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
@@ -915,6 +1094,50 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error getting user stats: {e}")
         await update.message.reply_text("❌ Error fetching your stats.")
+
+
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle verify button callback."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    
+    # Get current credits
+    credits = await get_verification_credits(user_id)
+    
+    # Generate verification link
+    verify_link = generate_verification_link(user_id, context)
+    
+    if not verify_link:
+        await query.answer(
+            "❌ Error generating link. Try /verify command.",
+            show_alert=True
+        )
+        return
+    
+    keyboard = [[
+        InlineKeyboardButton("🔗 Verify & Earn +5 Downloads", url=verify_link)
+    ]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.reply_text(
+        "💎 *Earn Extra Downloads!*\n\n"
+        f"📊 Current remaining: {credits} downloads\n\n"
+        "🎁 Complete verification to get:\n"
+        "   • +5 additional downloads instantly!\n\n"
+        "📝 *How it works:*\n"
+        "1. Click the button below\n"
+        "2. Complete the verification\n"
+        "3. Get instant +5 downloads!\n\n"
+        "💡 *Unlimited verifications!*\n"
+        "Need more downloads? Just verify again!\n\n"
+        "⏰ Daily quota: 5 downloads (base)\n"
+        "💎 Each verification: +5 downloads\n"
+        "🔄 Resets daily at midnight",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
 
 async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1032,22 +1255,36 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = query.data.replace("download_", "")
     user_id = query.from_user.id
     
-    # Check download limit for free users (STRICT 5 DOWNLOADS)
+    # Check download limit for free users
     can_download = await check_download_limit(user_id)
     if not can_download:
         remaining = await get_remaining_downloads(user_id)
         
-        keyboard = [[
+        keyboard = []
+        
+        keyboard.append([
+            InlineKeyboardButton("💎 Verify & Earn +5 Downloads", callback_data="verify_now")
+        ])
+        
+        keyboard.append([
             InlineKeyboardButton("💬 Get Premium", url="https://t.me/Venuboyy")
-        ]]
+        ])
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.message.reply_text(
+        message_text = (
             "⚠️ <b>Daily Download Limit Reached!</b>\n\n"
-            "🆓 Free users: 5 downloads per day\n"
-            "⭐ Premium users: Unlimited downloads\n\n"
-            f"📊 Your today's downloads: {remaining}\n\n"
-            "💬 Contact admin to get premium access!",
+            f"📊 Your remaining downloads: {remaining}\n\n"
+            "💎 <b>Get More Downloads:</b>\n"
+            "• Click 'Verify' to earn +5 downloads instantly!\n"
+            "• You can verify multiple times\n"
+            "• Each verification gives you 5 downloads\n\n"
+            "⭐ <b>Premium users:</b> Unlimited downloads\n\n"
+            "💬 Contact admin to get premium access!"
+        )
+        
+        await query.message.reply_text(
+            message_text,
             reply_markup=reply_markup,
             parse_mode='HTML'
         )
@@ -1218,11 +1455,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ *Commands:*\n"
         "/start - Start the bot\n"
         "/help - Show this help\n"
+        "/verify - Earn +5 downloads\n"
         "/mystats - Your statistics\n"
         "/myplan - Check premium status\n\n"
-        "⚠️ *Limits:*\n"
-        "🆓 Free: 5 downloads/day\n"
-        "⭐ Premium: Unlimited\n"
+        "⚠️ *Download Limits:*\n"
+        "🆓 Free: 5 downloads/day (base)\n"
+        "💎 Each verification: +5 downloads\n"
+        "🔄 Unlimited verifications per day\n"
+        "⭐ Premium: Unlimited downloads\n\n"
         "📦 Max file size: 50MB\n"
         "⚡ Speed: 100Mbps",
         parse_mode='Markdown'
@@ -1234,10 +1474,9 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
 
 
-async def post_init(application: Application) -> None:
-    """Clean up any existing webhooks/polling sessions after app initialization."""
+async def post_init(application: Application):
+    """Clean up old webhook."""
     try:
-        logger.info("Cleaning up existing connections...")
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("✅ Webhook deleted, ready for polling")
     except Exception as e:
@@ -1273,6 +1512,7 @@ def main():
     # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("verify", verify_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("mystats", my_stats))
     application.add_handler(CommandHandler("myplan", myplan_command))
@@ -1281,6 +1521,7 @@ def main():
     application.add_handler(CommandHandler("premium_users", premium_users_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
+    application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_now$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_music))
     application.add_handler(CallbackQueryHandler(download_callback))
     
@@ -1293,7 +1534,9 @@ def main():
     print(f"🗄️ MongoDB: {'Connected' if db is not None else 'Not connected'}")
     print(f"👥 Admin IDs: {ADMIN_USER_IDS}")
     print(f"⚡ Download Speed: 100Mbps (1MB chunks)")
-    print(f"🆓 Free Users: 5 downloads/day (NO trial)")
+    print(f"🆓 Free Users: 5 downloads/day (base)")
+    print(f"💎 Verification: +5 downloads per verification (unlimited)")
+    print(f"🔗 URL Shortener: userlinks.in")
     print(f"🌍 Timezone: Asia/Kolkata (India/Sri Lanka)")
     print("Press Ctrl+C to stop\n")
     
