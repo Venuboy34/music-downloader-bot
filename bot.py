@@ -48,10 +48,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb+srv://Veggo:zero8907@cluster0.o8sxezg.mongodb.net/?appName=Cluster0")
 ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "").split(",") if id.strip()]
 
-# URL Shortener Configuration
-SHORTENER_API = "920693e8f5b3e7289bd203327543123631080f07"
-SHORTENER_DOMAIN = "https://userlinks.in/api"
-SHORTENER_TYPE = "1"  # Use type=1 for 2-page verification (harder to bypass)
+# URL Shortener Configuration - adfly.site
+SHORTENER_API = "9a4803974a9dc9c639002d42c5a67f7c18961c0e"
+SHORTENER_DOMAIN = "https://adfly.site/api"
 
 # Force subscription channels
 FORCE_SUB_CHANNELS = [
@@ -80,8 +79,8 @@ try:
     users_collection = db['users']
     downloads_collection = db['downloads']
     stats_collection = db['stats']
-    verification_collection = db['verifications']  # New collection for tracking verifications
-    verification_tokens_collection = db['verification_tokens']  # Store verification tokens
+    verification_collection = db['verifications']
+    verification_tokens_collection = db['verification_tokens']
     logger.info("✅ MongoDB connected successfully")
 except ConnectionFailure as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
@@ -138,7 +137,7 @@ def create_session():
 http_session = create_session()
 
 
-def generate_random_token(length=16):
+def generate_random_token(length=32):
     """Generate a random secure token."""
     characters = string.ascii_letters + string.digits
     return ''.join(secrets.choice(characters) for _ in range(length))
@@ -146,7 +145,6 @@ def generate_random_token(length=16):
 
 def get_greeting():
     """Get greeting based on time of day in Asia/Kolkata timezone (India/Sri Lanka)."""
-    # Get current time in Asia/Kolkata timezone
     kolkata_tz = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(kolkata_tz)
     hour = current_time.hour
@@ -162,12 +160,13 @@ def get_greeting():
 
 
 def generate_verification_link(user_id, context):
-    """Generate a shortened verification link with random token for the user."""
+    """Generate a shortened verification link with random token using adfly.site."""
     try:
         if db is None:
+            logger.error("Database not available for verification")
             return None
         
-        # Generate random verification token (longer for more security)
+        # Generate random verification token (32 characters for security)
         token = generate_random_token(32)
         
         # Store token in database with expiration (24 hours)
@@ -183,36 +182,45 @@ def generate_verification_link(user_id, context):
         # Use the random token instead of user_id
         callback_url = f"https://t.me/{bot_username}?start=verify_{token}"
         
-        # Create shortened URL using userlinks.in API
-        # Using type=1 for 2-page verification (harder to bypass)
+        # Create shortened URL using adfly.site API with text response
         try:
-            # Build the API URL correctly
-            api_url = f"{SHORTENER_DOMAIN}?api={SHORTENER_API}&url={callback_url}&type={SHORTENER_TYPE}"
+            # Build the API URL
+            api_url = f"{SHORTENER_DOMAIN}?api={SHORTENER_API}&url={callback_url}&format=text"
             
-            logger.info(f"Calling shortener API: {api_url}")
+            logger.info(f"Calling adfly.site shortener API")
             
             shortener_response = http_session.get(
                 api_url,
-                timeout=10
+                timeout=15
             )
             
             if shortener_response.status_code == 200:
-                # The API returns the shortened URL directly as text
+                # Get the shortened URL from plain text response
                 short_url = shortener_response.text.strip()
                 
                 # Validate the shortened URL
-                if short_url.startswith('https://userlinks.in/'):
-                    logger.info(f"Generated short URL: {short_url}")
+                if short_url and (short_url.startswith('https://adfly.site/') or short_url.startswith('http://adfly.site/')):
+                    logger.info(f"✅ Generated short URL: {short_url}")
                     return short_url
                 else:
                     logger.error(f"Invalid shortener response: {short_url}")
+                    # Cleanup the unused token
+                    verification_tokens_collection.delete_one({'token': token})
                     return None
             else:
                 logger.error(f"Shortener API returned status {shortener_response.status_code}")
+                logger.error(f"Response: {shortener_response.text}")
+                # Cleanup the unused token
+                verification_tokens_collection.delete_one({'token': token})
                 return None
                 
         except Exception as e:
             logger.error(f"Error calling shortener API: {e}")
+            # Cleanup the unused token
+            try:
+                verification_tokens_collection.delete_one({'token': token})
+            except:
+                pass
             return None
             
     except Exception as e:
@@ -264,6 +272,7 @@ async def mark_user_verified(user_id):
             'verified_at': datetime.now()
         })
         
+        logger.info(f"✅ User {user_id} verified successfully")
         return True
     except Exception as e:
         logger.error(f"Error marking verification: {e}")
@@ -382,12 +391,6 @@ async def get_remaining_downloads(user_id):
         total_verifications = verification_collection.count_documents({
             'user_id': user_id,
             'verified_at': {'$gte': today}
-        })
-        
-        # Count downloads today
-        downloads_today = downloads_collection.count_documents({
-            'user_id': user_id,
-            'downloaded_at': {'$gte': today}
         })
         
         total_credits = 5 + (total_verifications * 5)
@@ -637,8 +640,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_premium:
         welcome_text += "⭐ *Premium User* - Enjoy unlimited downloads!\n\n"
     else:
-        welcome_text += "🆓 *Free User* - 5 downloads per day\n"
-        welcome_text += "💎 Earn +5 downloads by verifying! Use /verify\n\n"
+        remaining = await get_remaining_downloads(user.id)
+        welcome_text += f"🆓 *Free User* - {remaining} downloads remaining today\n\n"
     
     welcome_text += (
         "💡 *Example:*\n"
@@ -675,11 +678,17 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credits = await get_verification_credits(user_id)
     
     # Generate verification link
+    status_msg = await update.message.reply_text("🔗 Generating verification link...")
+    
     verify_link = generate_verification_link(user_id, context)
     
     if not verify_link:
-        await update.message.reply_text(
-            "❌ Error generating verification link. Please try again later."
+        await status_msg.edit_text(
+            "❌ Error generating verification link.\n\n"
+            "This might be due to:\n"
+            "• URL shortener service issue\n"
+            "• Database connection problem\n\n"
+            "Please try again in a few moments."
         )
         return
     
@@ -688,14 +697,14 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
+    await status_msg.edit_text(
         "💎 *Earn Extra Downloads!*\n\n"
         f"📊 Current remaining: {credits} downloads\n\n"
         "🎁 Complete verification to get:\n"
         "   • +5 additional downloads instantly!\n\n"
         "📝 *How it works:*\n"
         "1. Click the button below\n"
-        "2. Complete the verification\n"
+        "2. Complete the verification pages\n"
         "3. Get instant +5 downloads!\n\n"
         "💡 *Unlimited verifications!*\n"
         "Need more downloads? Just verify again!\n\n"
@@ -725,13 +734,14 @@ async def check_subscription_callback(update: Update, context: ContextTypes.DEFA
         return
     
     greeting = get_greeting()
+    remaining = await get_remaining_downloads(user_id)
+    
     welcome_text = (
         f"🎵 ʜᴇʏ {query.from_user.first_name}, {greeting}\n\n"
         "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
         "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
         "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
-        "🆓 *Free User* - 5 downloads per day\n"
-        "💎 Earn +5 downloads by verifying! Use /verify\n\n"
+        f"🆓 *Free User* - {remaining} downloads remaining today\n\n"
         "💡 *Example:*\n"
         "`Stardust zayn`\n"
         "`Perfect Ed Sheeran`\n\n"
@@ -1217,12 +1227,14 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     credits = await get_verification_credits(user_id)
     
     # Generate verification link
+    status_msg = await query.message.reply_text("🔗 Generating verification link...")
+    
     verify_link = generate_verification_link(user_id, context)
     
     if not verify_link:
-        await query.answer(
-            "❌ Error generating link. Try /verify command.",
-            show_alert=True
+        await status_msg.edit_text(
+            "❌ Error generating verification link.\n\n"
+            "Please try /verify command again."
         )
         return
     
@@ -1231,14 +1243,14 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.message.reply_text(
+    await status_msg.edit_text(
         "💎 *Earn Extra Downloads!*\n\n"
         f"📊 Current remaining: {credits} downloads\n\n"
         "🎁 Complete verification to get:\n"
         "   • +5 additional downloads instantly!\n\n"
         "📝 *How it works:*\n"
         "1. Click the button below\n"
-        "2. Complete the verification\n"
+        "2. Complete the verification pages\n"
         "3. Get instant +5 downloads!\n\n"
         "💡 *Unlimited verifications!*\n"
         "Need more downloads? Just verify again!\n\n"
@@ -1252,7 +1264,7 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Search for music based on user query."""
+    """Search for music based on user query - AutoFilter style."""
     user_id = update.effective_user.id
     
     # Check premium or subscription
@@ -1316,29 +1328,38 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             logger.info(f"Found {len(results)} results for: {query}")
             
+            # AutoFilter style - 2 columns layout
             keyboard = []
+            row = []
             for idx, result in enumerate(results[:10], 1):
                 video_id = result.get("video_id")
                 title = result.get("title", "Unknown Title")
                 duration = result.get("duration", "N/A")
                 
-                display_title = title[:45] + "..." if len(title) > 45 else title
+                # Short title for button (max 25 chars)
+                display_title = title[:22] + "..." if len(title) > 22 else title
                 
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"🎵 {idx}. {display_title} ({duration})",
-                        callback_data=f"download_{video_id}"
-                    )
-                ])
+                button = InlineKeyboardButton(
+                    f"🎵 {display_title}",
+                    callback_data=f"download_{video_id}"
+                )
+                
+                row.append(button)
+                
+                # Add row when we have 2 buttons or it's the last item
+                if len(row) == 2 or idx == len(results):
+                    keyboard.append(row)
+                    row = []
             
+            # Add close button
             keyboard.append([
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel")
+                InlineKeyboardButton("❌ Close", callback_data="cancel")
             ])
             
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await searching_msg.edit_text(
-                f"🎵 Found *{len(results)}* results for '*{query}*':\n\n"
+                f"🎵 *Found {len(results)} results for* `{query}`\n\n"
                 "👇 Click on a song to download:",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
@@ -1360,7 +1381,10 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     if query.data == "cancel":
-        await query.message.edit_text("❌ Search cancelled.")
+        try:
+            await query.message.delete()
+        except:
+            await query.message.edit_text("❌ Cancelled.")
         return
     
     video_id = query.data.replace("download_", "")
@@ -1401,7 +1425,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    download_msg = await query.message.reply_text("⬇️ Preparing download at high speed...")
+    download_msg = await query.message.reply_text("⬇️ Preparing download...")
     
     max_retries = 2
     for attempt in range(max_retries):
@@ -1439,7 +1463,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Optimized download with larger chunks for 100Mbps speed
             file_response = http_session.get(
                 file_url,
-                timeout=(30, 300),  # Increased timeout for large files
+                timeout=(30, 300),
                 stream=True
             )
             
@@ -1478,7 +1502,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await download_msg.edit_text(f"📤 Uploading: *{title}*\n⚡ Speed: 100Mbps", parse_mode='Markdown')
             
-            # Download thumbnail with optimized settings
+            # Download thumbnail
             thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
             thumb_path = os.path.join(TEMP_DIR, f"{video_id}_thumb.jpg")
             
@@ -1493,7 +1517,7 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Failed to download thumbnail: {e}")
                 thumb_path = None
             
-            # Send audio file with optimized upload
+            # Send audio file
             logger.info("Uploading audio file to user at high speed")
             with open(filepath, 'rb') as audio_file:
                 if thumb_path and os.path.exists(thumb_path):
@@ -1614,8 +1638,8 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .read_timeout(300)  # Increased for large file uploads
-        .write_timeout(300)  # Increased for large file uploads
+        .read_timeout(300)
+        .write_timeout(300)
         .connect_timeout(60)
         .pool_timeout(60)
         .build()
@@ -1648,9 +1672,10 @@ def main():
     print(f"⚡ Download Speed: 100Mbps (1MB chunks)")
     print(f"🆓 Free Users: 5 downloads/day (base)")
     print(f"💎 Verification: +5 downloads per verification (unlimited)")
-    print(f"🔗 URL Shortener: userlinks.in (2-page verification)")
+    print(f"🔗 URL Shortener: adfly.site")
     print(f"🔐 Secure tokens: 32-character random strings")
     print(f"⏰ Token expiry: 24 hours")
+    print(f"🎨 AutoFilter style: 2-column layout")
     print(f"🌍 Timezone: Asia/Kolkata (India/Sri Lanka)")
     print("Press Ctrl+C to stop\n")
     
