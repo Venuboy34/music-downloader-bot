@@ -5,6 +5,8 @@ import logging
 import time
 import asyncio
 import pytz
+import secrets
+import string
 from datetime import datetime, timedelta
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -48,7 +50,8 @@ ADMIN_USER_IDS = [int(id.strip()) for id in os.environ.get("ADMIN_USER_IDS", "")
 
 # URL Shortener Configuration
 SHORTENER_API = "920693e8f5b3e7289bd203327543123631080f07"
-SHORTENER_DOMAIN = "https://userlinks.in/st"
+SHORTENER_DOMAIN = "https://userlinks.in/api"
+SHORTENER_TYPE = "1"  # Use type=1 for 2-page verification (harder to bypass)
 
 # Force subscription channels
 FORCE_SUB_CHANNELS = [
@@ -78,6 +81,7 @@ try:
     downloads_collection = db['downloads']
     stats_collection = db['stats']
     verification_collection = db['verifications']  # New collection for tracking verifications
+    verification_tokens_collection = db['verification_tokens']  # Store verification tokens
     logger.info("✅ MongoDB connected successfully")
 except ConnectionFailure as e:
     logger.error(f"❌ MongoDB connection failed: {e}")
@@ -134,6 +138,12 @@ def create_session():
 http_session = create_session()
 
 
+def generate_random_token(length=16):
+    """Generate a random secure token."""
+    characters = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(characters) for _ in range(length))
+
+
 def get_greeting():
     """Get greeting based on time of day in Asia/Kolkata timezone (India/Sri Lanka)."""
     # Get current time in Asia/Kolkata timezone
@@ -152,15 +162,59 @@ def get_greeting():
 
 
 def generate_verification_link(user_id, context):
-    """Generate a shortened verification link for the user."""
+    """Generate a shortened verification link with random token for the user."""
     try:
+        if db is None:
+            return None
+        
+        # Generate random verification token (longer for more security)
+        token = generate_random_token(32)
+        
+        # Store token in database with expiration (24 hours)
+        verification_tokens_collection.insert_one({
+            'token': token,
+            'user_id': user_id,
+            'created_at': datetime.now(),
+            'expires_at': datetime.now() + timedelta(hours=24),
+            'used': False
+        })
+        
         bot_username = context.bot.username
-        callback_url = f"https://t.me/{bot_username}?start=verified_{user_id}"
+        # Use the random token instead of user_id
+        callback_url = f"https://t.me/{bot_username}?start=verify_{token}"
         
         # Create shortened URL using userlinks.in API
-        short_url = f"{SHORTENER_DOMAIN}?api={SHORTENER_API}&url={callback_url}"
-        
-        return short_url
+        # Using type=1 for 2-page verification (harder to bypass)
+        try:
+            # Build the API URL correctly
+            api_url = f"{SHORTENER_DOMAIN}?api={SHORTENER_API}&url={callback_url}&type={SHORTENER_TYPE}"
+            
+            logger.info(f"Calling shortener API: {api_url}")
+            
+            shortener_response = http_session.get(
+                api_url,
+                timeout=10
+            )
+            
+            if shortener_response.status_code == 200:
+                # The API returns the shortened URL directly as text
+                short_url = shortener_response.text.strip()
+                
+                # Validate the shortened URL
+                if short_url.startswith('https://userlinks.in/'):
+                    logger.info(f"Generated short URL: {short_url}")
+                    return short_url
+                else:
+                    logger.error(f"Invalid shortener response: {short_url}")
+                    return None
+            else:
+                logger.error(f"Shortener API returned status {shortener_response.status_code}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error calling shortener API: {e}")
+            return None
+            
     except Exception as e:
         logger.error(f"Error generating verification link: {e}")
         return None
@@ -431,32 +485,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if this is a verification callback
     if context.args and len(context.args) > 0:
         arg = context.args[0]
-        if arg.startswith('verified_'):
+        if arg.startswith('verify_'):
             try:
-                verified_user_id = int(arg.replace('verified_', ''))
+                token = arg.replace('verify_', '')
                 
-                if verified_user_id == user.id:
-                    # Mark user as verified
-                    success = await mark_user_verified(user.id)
-                    
-                    if success:
-                        credits = await get_verification_credits(user.id)
-                        await update.message.reply_text(
-                            "✅ *Verification Successful!*\n\n"
-                            "🎉 You've earned 5 additional downloads!\n"
-                            f"📊 Remaining downloads: {credits}\n\n"
-                            "💡 Tip: You can verify multiple times to get more downloads!\n\n"
-                            "You can now download more songs! 🎵",
-                            parse_mode='Markdown'
-                        )
-                    else:
-                        await update.message.reply_text(
-                            "❌ Verification failed. Please try again.",
-                            parse_mode='Markdown'
-                        )
+                if db is None:
+                    await update.message.reply_text(
+                        "❌ Database error. Please try again later."
+                    )
                     return
+                
+                # Find the token in database
+                token_data = verification_tokens_collection.find_one({
+                    'token': token,
+                    'used': False
+                })
+                
+                if not token_data:
+                    await update.message.reply_text(
+                        "❌ *Invalid or Expired Verification Link!*\n\n"
+                        "This link may have been:\n"
+                        "• Already used\n"
+                        "• Expired (24 hours limit)\n"
+                        "• Invalid\n\n"
+                        "Use /verify to get a new verification link.",
+                        parse_mode='Markdown'
+                    )
+                    return
+                
+                # Check if token is expired
+                if token_data['expires_at'] < datetime.now():
+                    await update.message.reply_text(
+                        "❌ *Verification Link Expired!*\n\n"
+                        "This link has expired (24 hours limit).\n\n"
+                        "Use /verify to get a new verification link.",
+                        parse_mode='Markdown'
+                    )
+                    return
+                
+                verified_user_id = token_data['user_id']
+                
+                if verified_user_id != user.id:
+                    await update.message.reply_text(
+                        "❌ *Verification Failed!*\n\n"
+                        "This verification link was created for a different user.\n\n"
+                        "Use /verify to get your own verification link.",
+                        parse_mode='Markdown'
+                    )
+                    return
+                
+                # Mark token as used
+                verification_tokens_collection.update_one(
+                    {'token': token},
+                    {'$set': {'used': True, 'used_at': datetime.now()}}
+                )
+                
+                # Mark user as verified
+                success = await mark_user_verified(user.id)
+                
+                if success:
+                    credits = await get_verification_credits(user.id)
+                    await update.message.reply_text(
+                        "✅ *Verification Successful!*\n\n"
+                        "🎉 You've earned 5 additional downloads!\n"
+                        f"📊 Remaining downloads: {credits}\n\n"
+                        "💡 Tip: You can verify multiple times to get more downloads!\n\n"
+                        "You can now download more songs! 🎵",
+                        parse_mode='Markdown'
+                    )
+                else:
+                    await update.message.reply_text(
+                        "❌ Verification failed. Please try again.",
+                        parse_mode='Markdown'
+                    )
+                return
             except Exception as e:
                 logger.error(f"Error processing verification: {e}")
+                await update.message.reply_text(
+                    "❌ An error occurred during verification. Please try again.",
+                    parse_mode='Markdown'
+                )
+                return
     
     save_user(user.id, user.username, user.first_name)
     
@@ -592,7 +701,8 @@ async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Need more downloads? Just verify again!\n\n"
         "⏰ Daily quota: 5 downloads (base)\n"
         "💎 Each verification: +5 downloads\n"
-        "🔄 Resets daily at midnight",
+        "🔄 Resets daily at midnight\n\n"
+        "⚠️ Link expires in 24 hours",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
@@ -1134,7 +1244,8 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Need more downloads? Just verify again!\n\n"
         "⏰ Daily quota: 5 downloads (base)\n"
         "💎 Each verification: +5 downloads\n"
-        "🔄 Resets daily at midnight",
+        "🔄 Resets daily at midnight\n\n"
+        "⚠️ Link expires in 24 hours",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
@@ -1464,7 +1575,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔄 Unlimited verifications per day\n"
         "⭐ Premium: Unlimited downloads\n\n"
         "📦 Max file size: 50MB\n"
-        "⚡ Speed: 100Mbps",
+        "⚡ Speed: 100Mbps\n"
+        "🔐 Secure verification system",
         parse_mode='Markdown'
     )
 
@@ -1536,7 +1648,9 @@ def main():
     print(f"⚡ Download Speed: 100Mbps (1MB chunks)")
     print(f"🆓 Free Users: 5 downloads/day (base)")
     print(f"💎 Verification: +5 downloads per verification (unlimited)")
-    print(f"🔗 URL Shortener: userlinks.in")
+    print(f"🔗 URL Shortener: userlinks.in (2-page verification)")
+    print(f"🔐 Secure tokens: 32-character random strings")
+    print(f"⏰ Token expiry: 24 hours")
     print(f"🌍 Timezone: Asia/Kolkata (India/Sri Lanka)")
     print("Press Ctrl+C to stop\n")
     
