@@ -179,6 +179,105 @@ async def is_premium_user(user_id):
         return False
 
 
+async def check_download_limit(user_id):
+    """Check if user has reached daily download limit (for free users)."""
+    if db is None:
+        return True  # Allow if DB not connected
+    
+    # Check if premium user
+    if await is_premium_user(user_id):
+        return True  # Unlimited for premium
+    
+    try:
+        # Get user data
+        user = users_collection.find_one({'user_id': user_id})
+        
+        # Check if user has used free trial
+        has_used_trial = user.get('trial_used', False) if user else False
+        
+        # Get today's date
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Count downloads today
+        downloads_today = downloads_collection.count_documents({
+            'user_id': user_id,
+            'downloaded_at': {'$gte': today}
+        })
+        
+        # If user hasn't used trial and this is their first download
+        if not has_used_trial and downloads_today == 0:
+            # Mark trial as used
+            users_collection.update_one(
+                {'user_id': user_id},
+                {'$set': {'trial_used': True}},
+                upsert=True
+            )
+            return True  # Allow free trial download
+        
+        # Free users get 5 downloads per day
+        if downloads_today >= 5:
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error checking download limit: {e}")
+        return True  # Allow on error
+
+
+async def get_remaining_downloads(user_id):
+    """Get remaining downloads for today."""
+    if db is None:
+        return "N/A"
+    
+    # Check if premium user
+    if await is_premium_user(user_id):
+        return "Unlimited ⭐"
+    
+    try:
+        user = users_collection.find_one({'user_id': user_id})
+        has_used_trial = user.get('trial_used', False) if user else False
+        
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        downloads_today = downloads_collection.count_documents({
+            'user_id': user_id,
+            'downloaded_at': {'$gte': today}
+        })
+        
+        # If trial not used, show +1 for free trial
+        if not has_used_trial and downloads_today == 0:
+            return "5/5 + 1 Free Trial 🎁"
+        
+        remaining = 5 - downloads_today
+        return f"{remaining}/5"
+    except:
+        return "5/5"
+
+
+async def show_trial_message(query, user_id):
+    """Show free trial usage message."""
+    try:
+        user = await query.get_bot().get_chat(user_id)
+        
+        await query.message.reply_text(
+            f"🎁 <b>Congratulations {user.first_name}!</b>\n\n"
+            "✨ You've used your <b>FREE TRIAL</b> download!\n\n"
+            "📊 <b>What's next?</b>\n\n"
+            "🆓 <b>Free Plan:</b>\n"
+            "   • 5 downloads per day\n\n"
+            "⭐ <b>Premium Plan:</b>\n"
+            "   • Unlimited downloads\n"
+            "   • No daily limits\n"
+            "   • Priority support\n\n"
+            "💬 Contact admin to upgrade to premium!",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Get Premium Now", url="https://t.me/Venuboyy")
+            ]])
+        )
+    except Exception as e:
+        logger.error(f"Error showing trial message: {e}")
+
+
 def save_user(user_id, username, first_name):
     """Save or update user in database."""
     if db is None:
@@ -323,11 +422,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Send welcome message
     greeting = get_greeting()
+    
+    # Check if user has trial available
+    user_data = users_collection.find_one({'user_id': user.id}) if db else None
+    has_trial = not user_data.get('trial_used', False) if user_data else True
+    
     welcome_text = (
         f"🎵 ʜᴇʏ {user.first_name}, {greeting}\n\n"
         "I ᴀᴍ ᴛʜᴇ ᴍᴏsᴛ ᴘᴏᴡᴇʀғᴜʟ ᴍᴜsɪᴄ ᴅᴏᴡɴʟᴏᴀᴅ ʙᴏᴛ with premium features 🎧\n\n"
         "I ᴄᴀɴ ᴘʀᴏᴠɪᴅᴇ any song you want instantly!\n\n"
         "Just send me the song name 🎶 and enjoy your music anytime!\n\n"
+    )
+    
+    if has_premium:
+        welcome_text += "⭐ *Premium User* - Enjoy unlimited downloads!\n\n"
+    elif has_trial:
+        welcome_text += "🎁 *Free Trial Available* - Get 1 extra download on us!\n\n"
+    
+    welcome_text += (
         "💡 *Example:*\n"
         "`Stardust zayn`\n"
         "`Perfect Ed Sheeran`\n\n"
@@ -436,22 +548,53 @@ async def myplan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⌛️ <b>ᴇxᴘɪʀʏ ᴅᴀᴛᴇ :</b> {expiry_str}"
             )
             
+            keyboard = [[
+                InlineKeyboardButton("💬 Contact Admin", url="https://t.me/Venuboyy")
+            ]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             await update.message.reply_photo(
                 photo=SUBSCRIPTION_IMAGE,
                 caption=caption,
+                reply_markup=reply_markup,
                 parse_mode='HTML'
             )
         else:
             raise Exception("No premium")
             
     except:
+        # Free user - show comparison
+        user_data = users_collection.find_one({'user_id': user_id}) if db else None
+        has_trial = not user_data.get('trial_used', False) if user_data else True
+        
+        caption = (
+            f"<b>ʜᴇʏ {user.mention_html()},\n\n"
+            f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴ.\n\n"
+            f"📊 <b>Free vs Premium:</b>\n\n"
+            f"🆓 <b>Free</b>\n"
+            f"   • Daily 5 downloads\n"
+        )
+        
+        if has_trial:
+            caption += f"   • 🎁 <b>+1 Free Trial</b> (One-time)\n"
+        
+        caption += (
+            f"\n⭐ <b>Premium</b>\n"
+            f"   • Unlimited downloading\n"
+            f"   • No daily limits\n"
+            f"   • Priority support\n\n"
+            f"💬 Contact admin to get premium access!</b>"
+        )
+        
+        keyboard = [[
+            InlineKeyboardButton("💬 Contact Admin", url="https://t.me/Venuboyy")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await update.message.reply_photo(
             photo=SUBSCRIPTION_IMAGE,
-            caption=(
-                f"<b>ʜᴇʏ {user.mention_html()},\n\n"
-                f"ʏᴏᴜ ᴅᴏɴ'ᴛ ʜᴀᴠᴇ ᴀɴ ᴀᴄᴛɪᴠᴇ ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴ.\n"
-                f"ᴄᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ᴛᴏ ɢᴇᴛ ᴘʀᴇᴍɪᴜᴍ ᴀᴄᴄᴇꜱꜱ.</b>"
-            ),
+            caption=caption,
+            reply_markup=reply_markup,
             parse_mode='HTML'
         )
 
@@ -773,14 +916,28 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         rank = users_collection.count_documents({'total_downloads': {'$gt': downloads}}) + 1
         
-        status = "⭐ Premium User" if has_premium else "👤 Free User"
+        status = "⭐ Premium User" if has_premium else "🆓 Free User"
+        remaining = await get_remaining_downloads(user_id)
         
-        await update.message.reply_text(
+        stats_text = (
             "📊 *Your Statistics*\n\n"
             f"{status}\n"
             f"📥 Total Downloads: *{downloads}*\n"
             f"🏆 Global Rank: *#{rank}*\n"
-            f"📅 Member Since: {joined.strftime('%B %d, %Y')}\n",
+            f"📅 Member Since: {joined.strftime('%B %d, %Y')}\n"
+        )
+        
+        if not has_premium:
+            stats_text += f"\n📊 Today's Downloads: *{remaining}*"
+        
+        keyboard = [[
+            InlineKeyboardButton("💬 Get Premium", url="https://t.me/Venuboyy")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            stats_text,
+            reply_markup=reply_markup,
             parse_mode='Markdown'
         )
     except Exception as e:
@@ -903,6 +1060,27 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = query.data.replace("download_", "")
     user_id = query.from_user.id
     
+    # Check download limit for free users
+    can_download = await check_download_limit(user_id)
+    if not can_download:
+        remaining = await get_remaining_downloads(user_id)
+        
+        keyboard = [[
+            InlineKeyboardButton("💬 Get Premium", url="https://t.me/Venuboyy")
+        ]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.reply_text(
+            "⚠️ <b>Daily Download Limit Reached!</b>\n\n"
+            "🆓 Free users: 5 downloads per day\n"
+            "⭐ Premium users: Unlimited downloads\n\n"
+            f"📊 Your today's downloads: {remaining}\n\n"
+            "💬 Contact admin to get premium access!",
+            reply_markup=reply_markup,
+            parse_mode='HTML'
+        )
+        return
+    
     download_msg = await query.message.reply_text("⬇️ Preparing download...")
     
     max_retries = 2
@@ -1016,6 +1194,20 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             
             logger.info("Audio file sent successfully")
+            
+            # Check if this was a trial download
+            user_data = users_collection.find_one({'user_id': user_id})
+            was_trial = user_data.get('trial_used', False) if user_data else False
+            
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            downloads_today = downloads_collection.count_documents({
+                'user_id': user_id,
+                'downloaded_at': {'$gte': today}
+            })
+            
+            # If this is the first download and trial was just used, show trial message
+            if was_trial and downloads_today == 1 and not await is_premium_user(user_id):
+                await show_trial_message(query, user_id)
             
             # Log download
             log_download(user_id, video_id, title)
