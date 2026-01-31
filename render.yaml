@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: telegram-music-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: API_BASE_URL
+        value: https://c0d8a915-cabf-4560-b61b-799b5757aff1-00-3jh8y5tlvnt4v.spock.replit.dev
+      - key: ADMIN_USER_IDS
+        sync: false
