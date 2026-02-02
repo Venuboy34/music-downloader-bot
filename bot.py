@@ -407,6 +407,13 @@ def download_youtube_audio(video_id, output_path):
             'writethumbnail': True,
             'nocheckcertificate': True,
             'geo_bypass': True,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Sec-Fetch-Mode': 'navigate',
+            },
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -684,26 +691,24 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await searching_msg.edit_text(f"❌ No results for '*{query}*'", parse_mode='Markdown')
             return
         
+        # 1-column layout with 10 results
         keyboard = []
-        row = []
         for idx, result in enumerate(results[:10], 1):
             video_id = result.get("video_id")
             title = result.get("title", "Unknown")
+            duration = result.get("duration", "N/A")
             
-            display_title = title[:22] + "..." if len(title) > 22 else title
+            # Truncate title to fit better in single column
+            display_title = title[:35] + "..." if len(title) > 35 else title
             
             button = InlineKeyboardButton(
-                f"🎵 {display_title}",
+                f"🎵 {idx}. {display_title} ({duration})",
                 callback_data=f"dl_{video_id}"
             )
-            
-            row.append(button)
-            
-            if len(row) == 2 or idx == len(results):
-                keyboard.append(row)
-                row = []
+            keyboard.append([button])
         
-        keyboard.append([InlineKeyboardButton("❌ Close", callback_data="cancel")])
+        # Add cancel button
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         
