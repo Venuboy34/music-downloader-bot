@@ -901,7 +901,7 @@ def main():
     application.add_error_handler(error_handler)
     
     print("\n✅ Music Bot Running!")
-    print(f"🗄️ MongoDB: {'✅' if db else '❌'}")
+    print(f"🗄️ MongoDB: {'✅' if db is not None else '❌'}")
     print("Press Ctrl+C to stop\n")
     
     application.run_polling(
