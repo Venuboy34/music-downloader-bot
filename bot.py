@@ -326,7 +326,7 @@ def search_youtube(query, limit=10):
         logger.info(f"Searching YouTube for: {query}")
         
         ydl_opts = {
-            'quiet': False,  # Enable output for debugging
+            'quiet': False,
             'no_warnings': False,
             'extract_flat': True,
             'skip_download': True,
@@ -338,7 +338,6 @@ def search_youtube(query, limit=10):
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
-                # Try with ytsearch prefix
                 search_url = f"ytsearch{limit}:{query}"
                 logger.info(f"Search URL: {search_url}")
                 
@@ -419,7 +418,6 @@ def download_youtube_audio(video_id, output_path):
             mp3_path = output_path + '.mp3'
             thumb_path = output_path + '.jpg'
             
-            # Add metadata
             if os.path.exists(mp3_path):
                 logger.info("Adding metadata to MP3...")
                 try:
@@ -434,7 +432,6 @@ def download_youtube_audio(video_id, output_path):
                     audio.tags['TPE1'] = TPE1(encoding=3, text=artist)
                     audio.tags['TALB'] = TALB(encoding=3, text=album)
                     
-                    # Add cover art
                     if os.path.exists(thumb_path):
                         logger.info("Adding album art...")
                         with open(thumb_path, 'rb') as img_file:
@@ -470,7 +467,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler."""
     user = update.effective_user
     
-    # Verification callback
     if context.args and len(context.args) > 0:
         arg = context.args[0]
         if arg.startswith('verify_'):
@@ -552,7 +548,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
     
-    # Send sticker
     try:
         sticker_msg = await update.message.reply_sticker(
             sticker="CAACAgIAAxkBAAEQYt1pfZPhPjP99PZfe3GQoyoKNlrStgACBT0AAiUmaUjLrgS38Ul59jgE"
@@ -685,7 +680,6 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await searching_msg.edit_text(f"❌ No results for '*{query}*'", parse_mode='Markdown')
             return
         
-        # 2-column layout
         keyboard = []
         row = []
         for idx, result in enumerate(results[:10], 1):
@@ -735,7 +729,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = query.data.replace("dl_", "")
     user_id = query.from_user.id
     
-    # Check limit
     can_download = await check_download_limit(user_id)
     if not can_download:
         keyboard = [
@@ -767,7 +760,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thumb_path = result['thumb_path']
         title = result['title']
         
-        # Check size
         file_size = os.path.getsize(mp3_path) / (1024 * 1024)
         if file_size > 50:
             await download_msg.edit_text(f"❌ Too large ({file_size:.1f}MB)")
@@ -778,7 +770,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await download_msg.edit_text(f"📤 Uploading *{title}*...", parse_mode='Markdown')
         
-        # Send audio
         with open(mp3_path, 'rb') as audio_file:
             if thumb_path and os.path.exists(thumb_path):
                 with open(thumb_path, 'rb') as thumb_file:
@@ -803,7 +794,6 @@ async def download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         log_download(user_id, video_id, title)
         
-        # Cleanup
         try:
             if os.path.exists(mp3_path):
                 os.remove(mp3_path)
@@ -933,7 +923,6 @@ def main():
         .build()
     )
     
-    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("verify", verify_command))
