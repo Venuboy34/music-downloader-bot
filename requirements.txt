@@ -1,6 +1,8 @@
 python-telegram-bot
-requests
+yt-dlp
+mutagen
 pymongo
-urllib3
 pytz
 flask
+requests
+pillow
