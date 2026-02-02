@@ -42,7 +42,8 @@ logger = logging.getLogger(__name__)
 
 # Silence logs
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
-logging.getLogger('yt_dlp').setLevel(logging.ERROR)
+# Enable yt-dlp logging for debugging
+logging.getLogger('yt_dlp').setLevel(logging.INFO)
 
 # Configuration
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -322,34 +323,65 @@ def log_download(user_id, video_id, title):
 def search_youtube(query, limit=10):
     """Search YouTube for music videos."""
     try:
+        logger.info(f"Searching YouTube for: {query}")
+        
         ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,  # Enable output for debugging
+            'no_warnings': False,
             'extract_flat': True,
+            'skip_download': True,
+            'ignoreerrors': True,
+            'nocheckcertificate': True,
+            'geo_bypass': True,
+            'default_search': 'ytsearch',
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            search_results = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-            
-            results = []
-            if 'entries' in search_results:
-                for entry in search_results['entries']:
-                    if entry:
-                        duration_seconds = entry.get('duration', 0)
-                        minutes = duration_seconds // 60
-                        seconds = duration_seconds % 60
-                        duration = f"{minutes}:{seconds:02d}" if duration_seconds else "N/A"
-                        
-                        results.append({
-                            'video_id': entry.get('id'),
-                            'title': entry.get('title', 'Unknown'),
-                            'duration': duration,
-                            'channel': entry.get('channel', 'Unknown')
-                        })
-            
-            return results
+            try:
+                # Try with ytsearch prefix
+                search_url = f"ytsearch{limit}:{query}"
+                logger.info(f"Search URL: {search_url}")
+                
+                search_results = ydl.extract_info(search_url, download=False)
+                
+                logger.info(f"Search results type: {type(search_results)}")
+                if search_results:
+                    logger.info(f"Search results keys: {search_results.keys() if isinstance(search_results, dict) else 'Not a dict'}")
+                
+                results = []
+                if search_results and 'entries' in search_results:
+                    logger.info(f"Found {len(search_results['entries'])} entries")
+                    
+                    for idx, entry in enumerate(search_results['entries']):
+                        if entry:
+                            duration_seconds = entry.get('duration', 0)
+                            minutes = duration_seconds // 60 if duration_seconds else 0
+                            seconds = duration_seconds % 60 if duration_seconds else 0
+                            duration = f"{minutes}:{seconds:02d}" if duration_seconds else "N/A"
+                            
+                            video_id = entry.get('id')
+                            title = entry.get('title', 'Unknown')
+                            
+                            logger.info(f"Entry {idx}: {video_id} - {title}")
+                            
+                            results.append({
+                                'video_id': video_id,
+                                'title': title,
+                                'duration': duration,
+                                'channel': entry.get('channel', entry.get('uploader', 'Unknown'))
+                            })
+                else:
+                    logger.warning(f"No entries found in search results")
+                
+                logger.info(f"Returning {len(results)} results")
+                return results
+                
+            except Exception as inner_e:
+                logger.error(f"Inner search error: {inner_e}", exc_info=True)
+                return []
+                
     except Exception as e:
-        logger.error(f"YouTube search error: {e}")
+        logger.error(f"YouTube search error: {e}", exc_info=True)
         return []
 
 
@@ -357,6 +389,7 @@ def download_youtube_audio(video_id, output_path):
     """Download YouTube audio as MP3 with metadata."""
     try:
         url = f"https://www.youtube.com/watch?v={video_id}"
+        logger.info(f"Downloading audio from: {url}")
         
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -366,23 +399,29 @@ def download_youtube_audio(video_id, output_path):
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,
+            'no_warnings': False,
             'writethumbnail': True,
+            'nocheckcertificate': True,
+            'geo_bypass': True,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            logger.info("Extracting video info...")
             info = ydl.extract_info(url, download=True)
             
             title = info.get('title', 'Unknown')
             artist = info.get('artist') or info.get('uploader', 'Unknown')
             album = info.get('album', 'YouTube')
             
+            logger.info(f"Downloaded: {title}")
+            
             mp3_path = output_path + '.mp3'
             thumb_path = output_path + '.jpg'
             
             # Add metadata
             if os.path.exists(mp3_path):
+                logger.info("Adding metadata to MP3...")
                 try:
                     audio = MP3(mp3_path, ID3=ID3)
                     
@@ -397,6 +436,7 @@ def download_youtube_audio(video_id, output_path):
                     
                     # Add cover art
                     if os.path.exists(thumb_path):
+                        logger.info("Adding album art...")
                         with open(thumb_path, 'rb') as img_file:
                             audio.tags['APIC'] = APIC(
                                 encoding=3,
@@ -407,8 +447,12 @@ def download_youtube_audio(video_id, output_path):
                             )
                     
                     audio.save()
+                    logger.info("Metadata saved successfully")
                 except Exception as e:
                     logger.warning(f"Metadata error: {e}")
+            else:
+                logger.error(f"MP3 file not found at: {mp3_path}")
+                return None
             
             return {
                 'mp3_path': mp3_path if os.path.exists(mp3_path) else None,
@@ -418,7 +462,7 @@ def download_youtube_audio(video_id, output_path):
             }
     
     except Exception as e:
-        logger.error(f"Download error: {e}")
+        logger.error(f"Download error: {e}", exc_info=True)
         return None
 
 
