@@ -354,9 +354,13 @@ def search_youtube(query, limit=10):
                     for idx, entry in enumerate(search_results['entries']):
                         if entry:
                             duration_seconds = entry.get('duration', 0)
-                            minutes = duration_seconds // 60 if duration_seconds else 0
-                            seconds = duration_seconds % 60 if duration_seconds else 0
-                            duration = f"{minutes}:{seconds:02d}" if duration_seconds else "N/A"
+                            if duration_seconds:
+                                duration_seconds = int(duration_seconds)  # Convert to int to handle floats
+                                minutes = duration_seconds // 60
+                                seconds = duration_seconds % 60
+                                duration = f"{minutes}:{seconds:02d}"
+                            else:
+                                duration = "N/A"
                             
                             video_id = entry.get('id')
                             title = entry.get('title', 'Unknown')
